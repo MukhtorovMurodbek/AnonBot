@@ -350,6 +350,25 @@ def count_active_users_since(since) -> int:
         return cur.fetchone()[0]
 
 
+def list_all_users() -> list[int]:
+    """Everyone this bot could send an unprompted message to.
+
+    The union of two tables because neither is the whole answer on its own:
+    user_settings has a row per person who has ever picked a setting and is never
+    pruned, while activity_events reaches people who only ever used the bot
+    without changing anything -- but is pruned at ACTIVITY_RETENTION_DAYS.
+    Together they are "everyone we still know about", which is the honest
+    scope of a broadcast.
+    """
+    with pooled() as conn:
+        cur = conn.execute(
+            "SELECT user_id FROM user_settings "
+            "UNION "
+            "SELECT DISTINCT user_id FROM activity_events"
+        )
+        return [int(r[0]) for r in cur.fetchall()]
+
+
 def get_user_language(user_id: int) -> str | None:
     """None means the user hasn't picked a language yet (no row, or a row
     with no language set)."""

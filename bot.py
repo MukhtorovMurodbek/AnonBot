@@ -52,7 +52,9 @@ try:  # optional convenience: load env vars from a local .env file
 except ImportError:
     pass
 
-from telegram import BotCommand, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
@@ -68,6 +70,8 @@ from telegram.ext import (
 
 import family_link
 import i18n
+import lifecycle
+from live_message import LiveMessage, edit_in_place
 from anon_logic import italicize, relay_content
 from db import (
     clear_follower_state,
@@ -150,10 +154,15 @@ def _is_admin(user_id: int) -> bool:
 async def _reply(update: Update, text: str, **kwargs):
     """Works whether this came from a command or a button tap -- the first-run
     language picker means a brand-new user can reach any of these paths from
-    a callback query, which has no message of its own to reply to."""
+    a callback query, which has no message of its own to reply to.
+
+    The button path evolves the tapped message in place, but only while it is
+    still the last thing in the chat; once the user has typed anything since,
+    a rewrite would land above their own message and out of sight, so a new
+    message is sent instead. See live_message.py."""
     if update.message:
-        return await update.message.reply_text(text, **kwargs)
-    return await update.callback_query.message.edit_text(text, **kwargs)
+        return await LiveMessage.reply_to(update.message, text, **kwargs)
+    return await edit_in_place(update.callback_query.message, update.get_bot(), text, **kwargs)
 
 
 def build_help_text(lang: str) -> str:
@@ -166,6 +175,7 @@ def build_help_text(lang: str) -> str:
 # commands are described in the language they switch to (self-explanatory
 # by script/language, since Telegram's command menu itself isn't per-user).
 BOT_COMMANDS = [
+    BotCommand("start", "Start here / see the instructions"),
     BotCommand("link", "Get your inbox link"),
     BotCommand("newlink", "Reset your link (invalidates the old one)"),
     BotCommand("pause", "Stop accepting new conversations"),
@@ -422,7 +432,7 @@ async def anonlink_toggle_callback(update: Update, context: ContextTypes.DEFAULT
     await asyncio.to_thread(set_anon_link_paused, owner_id, new_paused)
     await query.answer(i18n.t(lang, "anonlink_paused_answer" if new_paused else "anonlink_resumed_answer"))
     text, kb = _link_message(state["token"], new_paused, lang)
-    await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await edit_in_place(query.message, context.bot, text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 async def anonlink_newlink_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -435,7 +445,7 @@ async def anonlink_newlink_callback(update: Update, context: ContextTypes.DEFAUL
     token, is_paused = await asyncio.to_thread(regenerate_anon_link, owner_id)
     await query.answer(i18n.t(lang, "anonlink_newlink_answer"))
     text, kb = _link_message(token, is_paused, lang)
-    await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await edit_in_place(query.message, context.bot, text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 async def newlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -476,15 +486,15 @@ async def dbdump_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hand out on request."""
     if not _is_admin(update.effective_user.id):
         return
-    status = await update.message.reply_text("Exporting the database...")
+    status = await LiveMessage.reply_to(update.message, "Exporting the database...")
     try:
         data = await asyncio.to_thread(dump_database_csv_zip)
     except Exception as exc:
-        await status.edit_text(f"⚠️ Export failed: {exc}")
+        await status.set(context.bot, f"⚠️ Export failed: {exc}")
         return
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
     await update.message.reply_document(document=BytesIO(data), filename=f"anonbot_db_{stamp}.zip")
-    await status.delete()
+    await status.delete(context.bot)
 
 
 async def messageas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -632,10 +642,7 @@ async def unblock_from_list_callback(update: Update, context: ContextTypes.DEFAU
     await asyncio.to_thread(set_anon_blocked, owner_id, follower_id, False)
     await query.answer(i18n.t(lang, "unblocked_answer"))
     text, kb = await _blocked_list_text_and_kb(owner_id, lang)
-    try:
-        await query.edit_message_text(text, reply_markup=kb)
-    except BadRequest:
-        pass
+    await edit_in_place(query.message, context.bot, text, reply_markup=kb)
 
 
 # ---------- the reply requirement, and the way past it ----------
@@ -648,6 +655,22 @@ async def unblock_from_list_callback(update: Update, context: ContextTypes.DEFAU
 PENDING_KEY = "anon_pending_message"
 
 
+def _restore_pending(stored, bot):
+    """The held message and its destination, or (None, None).
+
+    Accepts only the dict form; anything else -- including the (Message,
+    int) tuple older code parked here -- reads as nothing held, which is
+    the same answer the user got before any of this was persisted."""
+    if not isinstance(stored, dict):
+        return None, None
+    try:
+        held = Message.de_json(stored["message"], bot)
+        conversation_id = int(stored["conversation_id"])
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    return (held, conversation_id) if held is not None else (None, None)
+
+
 async def _hold_for_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str, conversation_id: int | None):
     """Nothing was sent, because nothing said where it was going.
 
@@ -658,14 +681,25 @@ async def _hold_for_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, la
     button instead of by the router."""
     # The message itself, not its id: a bot cannot fetch a message back by
     # id, and Message.reply_text does not quote in private chats, so the
-    # callback has no way to find it again otherwise. user_data is in-memory,
-    # which is exactly the lifetime this needs.
+    # callback has no way to find it again otherwise.
+    #
+    # Kept as to_dict() rather than as the Message object, and as a dict
+    # rather than as a tuple, because a tuple holding a Message is exactly
+    # what lifecycle.PostgresPersistence declines to write -- and of
+    # everything this bot parks in user_data, this is the one whose loss a
+    # user actually sees, as "that message expired" on a button they were
+    # looking at seconds earlier. to_dict() is plain JSON that survives the
+    # round trip unchanged, and Message.de_json() rebuilds a working Message
+    # from it in whichever process picks the tap up.
     if conversation_id is None:
         context.user_data.pop(PENDING_KEY, None)
         await update.message.reply_text(i18n.t(lang, "must_reply_ambiguous"), do_quote=True)
         return
 
-    context.user_data[PENDING_KEY] = (update.message, conversation_id)
+    context.user_data[PENDING_KEY] = {
+        "message": update.message.to_dict(),
+        "conversation_id": conversation_id,
+    }
     await update.message.reply_text(
         i18n.t(lang, "must_reply"),
         do_quote=True,
@@ -680,19 +714,20 @@ async def _hold_for_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, la
 async def send_anyway_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     lang = await i18n.get_lang(update.effective_user.id, context)
-    pending = context.user_data.pop(PENDING_KEY, None)
-    if not pending:
+    held, conversation_id = _restore_pending(
+        context.user_data.pop(PENDING_KEY, None), context.bot
+    )
+    if held is None:
         await query.answer(i18n.t(lang, "must_reply_expired"), show_alert=True)
         return
-    held, conversation_id = pending
     await query.answer()
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except BadRequest:
         pass
 
-    # user_data does not survive a restart, so re-read the conversation
-    # rather than trusting the held pair to still describe the world.
+    # The held message may have crossed a redeploy to get here, so re-read
+    # the conversation rather than trusting it to still describe the world.
     active = await asyncio.to_thread(get_active_conversation_for_follower, update.effective_user.id)
     if not active or active["id"] != conversation_id:
         await query.message.reply_text(i18n.t(lang, "must_reply_expired"))
@@ -975,7 +1010,16 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _post_init(application):
     await tune_runtime(application)
+    # Before the first getUpdates -- see lifecycle.py: two containers polling
+    # one token is 409 Conflict and split updates, not a graceful overlap.
+    await lifecycle.on_start(BOT_NAME)
     await application.bot.set_my_commands(BOT_COMMANDS)
+
+
+async def _post_stop(application):
+    # Before flush_on_shutdown, which closes the pool lifecycle writes through.
+    await lifecycle.on_stop(application)
+    await flush_on_shutdown(application)
 
 
 def main():
@@ -983,10 +1027,17 @@ def main():
         raise SystemExit("Set ABOT_TOKEN and ABOT_USERNAME environment variables first.")
 
     init_db()
-    app = (
+    builder = (
         ApplicationBuilder().token(BOT_TOKEN)
-        .post_init(_post_init).post_stop(flush_on_shutdown).build()
+        .post_init(_post_init).post_stop(_post_stop)
     )
+    # Open conversations kept in Postgres, so a redeploy is not the end of
+    # somebody's half-written message. See lifecycle.py.
+    state = lifecycle.persistence()
+    if state is not None:
+        builder = builder.persistence(state)
+    app = builder.build()
+    lifecycle.install(app, BOT_NAME)
     app.add_error_handler(error_handler)
     app.add_handler(TypeHandler(Update, track_activity), group=-1)
     # Runs after track_activity but before every other handler (including the
@@ -1051,11 +1102,11 @@ def main():
     # answers the moment an update exists -- for a third of the HTTP requests.
     # allowed_updates lists every kind this bot has a handler for, so Telegram
     # stops sending the rest rather than this process parsing and dropping it.
-    app.run_polling(
+    app.run_polling(**lifecycle.polling_kwargs(
         timeout=POLL_TIMEOUT,
         allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY, Update.PRE_CHECKOUT_QUERY],
-    )
+    ))
 
 
 if __name__ == "__main__":
-    main()
+    main()

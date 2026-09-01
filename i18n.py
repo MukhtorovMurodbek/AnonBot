@@ -179,6 +179,10 @@ STRINGS = {
             "could reach the wrong person. Nothing was sent."
         ),
         "must_reply_expired": "That message is no longer waiting to be sent -- send it again.",
+        "update_soon_try_later": "🔧 I'm being updated in a moment, so I can't start anything new right now — please try again in about {minutes} minute(s). I'll message you when I'm back.",
+        "update_soon_try_later_soon": "🔧 I'm being updated right now, so I can't start anything new — please try again shortly. I'll message you when I'm back.",
+        "update_will_reset": "🔧 Heads up: I'm about to be updated, and what you have going right now will be reset. You'll be able to start it again in a few minutes.",
+        "update_done_try_now": '✅ The update is done — go ahead and try again now.',
         "reply_forbidden": "Couldn't deliver your reply -- they may have blocked or left the bot.",
         "reply_failed": "Couldn't deliver your reply: {error}",
         "delivered_confirmation": "Delivered ↩️",
@@ -331,6 +335,10 @@ STRINGS = {
             "mumkin. Hech narsa yuborilmadi."
         ),
         "must_reply_expired": "Bu xabar endi yuborishni kutmayapti — qaytadan yuboring.",
+        "update_soon_try_later": "🔧 Hozir yangilanaman, shuning uchun yangi ish boshlay olmayman — taxminan {minutes} daqiqadan so'ng qaytadan urinib ko'ring. Qaytganimda o'zim xabar beraman.",
+        "update_soon_try_later_soon": "🔧 Hozir yangilanmoqdaman, shuning uchun yangi ish boshlay olmayman — birozdan so'ng qaytadan urinib ko'ring. Qaytganimda o'zim xabar beraman.",
+        "update_will_reset": "🔧 Diqqat: men yangilanmoqchiman va hozir boshlagan ishingiz bekor qilinadi. Bir necha daqiqadan so'ng qaytadan boshlashingiz mumkin.",
+        "update_done_try_now": "✅ Yangilanish tugadi — endi qaytadan urinib ko'rishingiz mumkin.",
         "reply_forbidden": "Javobingizni yetkazib bo'lmadi — ular sizni bloklagan yoki botni tark etgan bo'lishi mumkin.",
         "reply_failed": "Javobingizni yetkazib bo'lmadi: {error}",
         "delivered_confirmation": "Yetkazildi ↩️",
@@ -481,6 +489,10 @@ STRINGS = {
             "\u043c\u043e\u0436\u0435\u0442 \u0443\u0439\u0442\u0438 \u043d\u0435 \u0442\u043e\u043c\u0443 \u0447\u0435\u043b\u043e\u0432\u0435\u043a\u0443. \u041d\u0438\u0447\u0435\u0433\u043e \u043d\u0435 \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e."
         ),
         "must_reply_expired": "Это сообщение больше не ждёт отправки — напишите его заново.",
+        "update_soon_try_later": '🔧 Сейчас меня обновляют, поэтому я не могу начать ничего нового — попробуйте снова примерно через {minutes} мин. Я напишу, когда вернусь.',
+        "update_soon_try_later_soon": '🔧 Сейчас меня обновляют, поэтому я не могу начать ничего нового — попробуйте снова чуть позже. Я напишу, когда вернусь.',
+        "update_will_reset": '🔧 Внимание: меня скоро обновят, и то, что вы сейчас начали, будет сброшено. Через несколько минут сможете начать заново.',
+        "update_done_try_now": '✅ Обновление завершено — можете пробовать снова.',
         "reply_forbidden": "Не удалось доставить ваш ответ — возможно, вас заблокировали или человек покинул бота.",
         "reply_failed": "Не удалось доставить ваш ответ: {error}",
         "delivered_confirmation": "Доставлено ↩️",
