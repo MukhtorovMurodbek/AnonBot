@@ -116,7 +116,8 @@ STRINGS = {
             "the message you're answering -- swipe it, or tap the Reply "
             "button under it -- so your words always land in the right "
             "conversation.\n\nTapping this link again later starts a "
-            "brand-new conversation, separate from this one."
+            "brand-new conversation, separate from this one -- and this one "
+            "keeps working: reply to any message in it whenever you like."
         ),
         "link_status_paused": "paused -- not accepting new conversations",
         "link_status_active": "accepting messages",
@@ -153,7 +154,12 @@ STRINGS = {
         "not_your_conversation": "Not your conversation.",
         "blocked_answer": "Blocked.",
         "unblock_button": "↩️ Undo",
-        "blocked_notice": "\U0001f6ab Conversation #{conv_number} is blocked -- they can no longer message you. /blocked to review.",
+        "unblock_button_labelled": "↩️ Unblock conversation #{conv_number}",
+        "too_fast": "You're sending those faster than I can pass them on -- give it about {seconds} second(s) and try again.",
+        "edit_not_relayed": (
+            "I'd already passed that message on, so the edit didn't reach them -- they "
+            "still have what you first wrote. Reply to it again with the correction."
+        ),
         "unblocked_answer": "Unblocked.",
         "delivery_blocked": "Your message couldn't be delivered.",
         "inbox_gone": "This inbox no longer exists.",
@@ -187,8 +193,9 @@ STRINGS = {
         "reply_failed": "Couldn't deliver your reply: {error}",
         "delivered_confirmation": "Delivered ↩️",
         "reply_stale": (
-            "That reply doesn't match any conversation I have on record -- it may "
-            "be too old, or not something I'm tracking. Nothing was sent."
+            "I don't have that message on record, so I can't tell which conversation "
+            "this answers. Reply to one of the messages I delivered here instead -- "
+            "swipe it, or tap ↩️ Reply under it. Nothing was sent."
         ),
         "generic_nudge": "Not sure what this is for -- if someone sent you a link, tap that first. Want your own inbox? Send /link.",
         "unknown_command": "I don't recognize that command. Send /help to see what I can do.",
@@ -270,7 +277,9 @@ STRINGS = {
             "keyin javob berayotgan xabaringizni belgilang \u2014 uni suring "
             "yoki ostidagi Javob tugmasini bosing \u2014 shunda gaplaringiz "
             "doim to'g'ri suhbatga tushadi.\n\nBu havolani keyinroq yana "
-            "bossangiz, bundan alohida yangi suhbat boshlanadi."
+            "bossangiz, bundan alohida yangi suhbat boshlanadi — bu suhbat esa "
+            "ishlashda davom etadi: undagi istalgan xabarga xohlagan paytda "
+            "javob bera olasiz."
         ),
         "link_status_paused": "pauza qilingan — yangi suhbatlar qabul qilinmaydi",
         "link_status_active": "xabarlarni qabul qilmoqda",
@@ -307,7 +316,12 @@ STRINGS = {
         "not_your_conversation": "Bu sizning suhbatingiz emas.",
         "blocked_answer": "Bloklandi.",
         "unblock_button": "↩️ Bekor qilish",
-        "blocked_notice": "\U0001f6ab #{conv_number}-suhbat bloklandi — u endi sizga xabar yubora olmaydi. Ko'rib chiqish uchun /blocked.",
+        "unblock_button_labelled": "↩️ #{conv_number}-suhbatni blokdan chiqarish",
+        "too_fast": "Xabarlarni men yetkazishga ulgurmayotgan tezlikda yuboryapsiz — taxminan {seconds} soniyadan so'ng qayta urinib ko'ring.",
+        "edit_not_relayed": (
+            "Bu xabarni allaqachon yetkazgan edim, shuning uchun tahrir unga bormadi — "
+            "unda hali dastlabki matn turibdi. Tuzatishni o'sha xabarga javob qilib qayta yuboring."
+        ),
         "unblocked_answer": "Blokdan chiqarildi.",
         "delivery_blocked": "Xabaringiz yetkazilmadi.",
         "inbox_gone": "Bu quti endi mavjud emas.",
@@ -343,8 +357,9 @@ STRINGS = {
         "reply_failed": "Javobingizni yetkazib bo'lmadi: {error}",
         "delivered_confirmation": "Yetkazildi ↩️",
         "reply_stale": (
-            "Bu javob mening yozuvlarimdagi hech qanday suhbatga to'g'ri kelmayapti "
-            "— u juda eski bo'lishi yoki men kuzatmayotgan narsa bo'lishi mumkin. "
+            "Bu xabar mening yozuvlarimda yo'q, shuning uchun bu qaysi suhbatga "
+            "javob ekanini bilmayapman. Men shu yerga yetkazgan xabarlardan biriga "
+            "javob bering — uni suring yoki ostidagi ↩️ tugmasini bosing. "
             "Hech narsa yuborilmadi."
         ),
         "generic_nudge": "Bu nima uchunligini tushunmadim — agar sizga kimdir havola yuborgan bo'lsa, avval o'shani bosing. O'z qutingiz kerakmi? /link yuboring.",
@@ -426,7 +441,8 @@ STRINGS = {
             "\u043e\u0442\u0432\u0435\u0447\u0430\u0439\u0442\u0435 \u043d\u0430 \u0442\u043e \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435, \u043a\u043e\u0442\u043e\u0440\u043e\u043c\u0443 \u043e\u0442\u0432\u0435\u0447\u0430\u0435\u0442\u0435 \u2014 "
             "\u0441\u0432\u0430\u0439\u043f\u043d\u0438\u0442\u0435 \u0435\u0433\u043e \u0438\u043b\u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u041e\u0442\u0432\u0435\u0442\u0438\u0442\u044c \u043f\u043e\u0434 \u043d\u0438\u043c, "
             "\u0447\u0442\u043e\u0431\u044b \u0441\u043b\u043e\u0432\u0430 \u0432\u0441\u0435\u0433\u0434\u0430 \u043f\u043e\u043f\u0430\u0434\u0430\u043b\u0438 \u0432 \u043d\u0443\u0436\u043d\u0443\u044e \u0431\u0435\u0441\u0435\u0434\u0443.\n\n"
-            "\u0415\u0441\u043b\u0438 \u043f\u0435\u0440\u0435\u0439\u0442\u0438 \u043f\u043e \u044d\u0442\u043e\u0439 \u0441\u0441\u044b\u043b\u043a\u0435 \u0441\u043d\u043e\u0432\u0430 \u043f\u043e\u0437\u0436\u0435, \u043d\u0430\u0447\u043d\u0451\u0442\u0441\u044f \u043e\u0442\u0434\u0435\u043b\u044c\u043d\u0430\u044f \u043d\u043e\u0432\u0430\u044f \u0431\u0435\u0441\u0435\u0434\u0430."
+            "\u0415\u0441\u043b\u0438 \u043f\u0435\u0440\u0435\u0439\u0442\u0438 \u043f\u043e \u044d\u0442\u043e\u0439 \u0441\u0441\u044b\u043b\u043a\u0435 \u0441\u043d\u043e\u0432\u0430 \u043f\u043e\u0437\u0436\u0435, \u043d\u0430\u0447\u043d\u0451\u0442\u0441\u044f \u043e\u0442\u0434\u0435\u043b\u044c\u043d\u0430\u044f \u043d\u043e\u0432\u0430\u044f \u0431\u0435\u0441\u0435\u0434\u0430 \u2014 "
+            "\u0430 \u044d\u0442\u0430 \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u0442 \u0440\u0430\u0431\u043e\u0442\u0430\u0442\u044c: \u043e\u0442\u0432\u0435\u0447\u0430\u0439\u0442\u0435 \u043d\u0430 \u043b\u044e\u0431\u043e\u0435 \u0435\u0451 \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 \u043a\u043e\u0433\u0434\u0430 \u0443\u0433\u043e\u0434\u043d\u043e."
         ),
         "link_status_paused": "на паузе — новые беседы не принимаются",
         "link_status_active": "принимает сообщения",
@@ -463,7 +479,12 @@ STRINGS = {
         "not_your_conversation": "Это не ваша беседа.",
         "blocked_answer": "Заблокировано.",
         "unblock_button": "↩️ Отменить",
-        "blocked_notice": "\U0001f6ab Беседа #{conv_number} заблокирована — он больше не может вам писать. /blocked, чтобы посмотреть список.",
+        "unblock_button_labelled": "↩️ Разблокировать беседу #{conv_number}",
+        "too_fast": "Вы отправляете быстрее, чем я успеваю передавать — подождите около {seconds} сек. и попробуйте снова.",
+        "edit_not_relayed": (
+            "Это сообщение я уже передал, поэтому правка до собеседника не дошла — "
+            "у него прежний текст. Отправьте исправление ещё раз ответом на него."
+        ),
         "unblocked_answer": "Разблокирован.",
         "delivery_blocked": "Ваше сообщение не удалось доставить.",
         "inbox_gone": "Этого ящика больше не существует.",
@@ -497,8 +518,9 @@ STRINGS = {
         "reply_failed": "Не удалось доставить ваш ответ: {error}",
         "delivered_confirmation": "Доставлено ↩️",
         "reply_stale": (
-            "Этот ответ не соответствует ни одной беседе в моих записях — возможно, "
-            "он слишком старый или это не то, что я отслеживаю. Ничего не отправлено."
+            "Этого сообщения нет в моих записях, поэтому я не могу понять, какой "
+            "беседе оно отвечает. Ответьте на одно из сообщений, которые я сюда "
+            "доставил — свайпните его или нажмите ↩️ под ним. Ничего не отправлено."
         ),
         "generic_nudge": "Не совсем понял, для чего это -- если кто-то прислал вам ссылку, сначала перейдите по ней. Хотите свой ящик? Отправьте /link.",
         "unknown_command": "Я не знаю такую команду. Отправь /help, чтобы увидеть, что я умею.",

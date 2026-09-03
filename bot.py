@@ -59,6 +59,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     ApplicationBuilder,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -72,7 +73,12 @@ import family_link
 import i18n
 import lifecycle
 from live_message import LiveMessage, edit_in_place
-from anon_logic import italicize, relay_content
+from anon_logic import (
+    italicize,
+    message_allowed,
+    new_conversation_allowed,
+    relay_content,
+)
 from db import (
     clear_follower_state,
     get_active_conversation_for_follower,
@@ -80,6 +86,8 @@ from db import (
     get_anon_stats,
     get_conversation,
     get_conversation_for_relay,
+    get_routing_context,
+    forget_anon_relay,
     list_anon_blocks_with_conversations,
     get_delivery_context,
     get_link_view,
@@ -90,7 +98,6 @@ from db import (
     record_relay_and_touch,
     record_anon_relays,
     mark_follower_opened,
-    count_owner_conversations,
     regenerate_anon_link,
     set_anon_blocked,
     set_anon_link_paused,
@@ -102,6 +109,7 @@ from shared_features import (
     attach_maintenance,
     CANCEL_PICK_ALL,
     CANCEL_PICK_NONE,
+    FORCE_REPLY_KEY,
     CancelItem,
     ask_cancel_choice,
     cancel_choice_key,
@@ -122,6 +130,7 @@ from shared_features import (
     donation_payment_callback,
     donation_precheckout_callback,
     maybe_donation_nudge,
+    refuse_new_work,
     sibling_bots_blurb,
     sibling_bots_keyboard_row,
     setup_logging,
@@ -149,6 +158,19 @@ POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
 
 def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+async def _deny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """How an owner-only command answers everybody else: exactly the way a
+    misspelling does.
+
+    The intent was always to avoid confirming the command exists, and a bare
+    `return` looked like the way to do that. It is not: a bot that answers
+    every command it has and ignores precisely one has just pointed at the
+    interesting one, and to the person who typed it the bot simply looks
+    broken. Giving back the same sentence a typo gets makes the owner-only
+    commands indistinguishable from commands that were never there.
+    """
+    await unknown_command(update, context)
+
 
 
 async def _reply(update: Update, text: str, **kwargs):
@@ -225,8 +247,18 @@ def _quote_of(message, limit: int = 120) -> str:
     cannot make the client quote the guest's message directly. Putting the
     text inside the prompt is the next best thing: whatever the reply box
     quotes, what it quotes now contains the words being answered.
+
+    Only the words. What arrives in the chat is the bot's own
+    "Conversation #6" header, a blank line, and then the person's message --
+    so quoting the bubble whole produced "Replying in conversation #6, to:
+    Conversation #6 Yo", which says the number twice and quotes the bot to
+    itself. The header is separated by the blank line relay_content puts
+    there, so dropping the part above it leaves exactly what somebody wrote.
     """
     body = message.text or message.caption or ""
+    _, sep, after = body.partition("\n\n")
+    if sep:
+        body = after
     body = " ".join(body.split())
     if not body:
         return italicize("[media]")
@@ -370,6 +402,24 @@ async def start_follow_link(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await _reply(update, i18n.t(lang, "follow_link_paused"))
         return
 
+    # Opening a conversation writes rows the owner is then notified about,
+    # and it is one tap to do. A short cooldown is the difference between a
+    # misfire and somebody filling an inbox with empty threads.
+    wait = new_conversation_allowed(follower.id)
+    if wait:
+        await _reply(update, i18n.t(lang, "too_fast", seconds=wait))
+        return
+
+    # An update the owner has announced can span several deploys, and a
+    # conversation opened into one starts a thread the database may be in the
+    # middle of migrating underneath. Being told to come back in ten minutes,
+    # once, beats finding out afterwards -- and refuse_new_work writes this
+    # person down so /finishupdates goes back to them.
+    refusal = await refuse_new_work(lang, follower.id, update.effective_chat.id)
+    if refusal:
+        await _reply(update, refusal)
+        return
+
     conv = await asyncio.to_thread(start_new_anon_conversation, owner_id, follower.id)
     opening = await _reply(
         update, i18n.t(lang, "follow_link_started", conv_number=conv["conv_number"])
@@ -485,7 +535,7 @@ async def dbdump_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     zip of CSVs. Owner-only: this is every user's data, not something to
     hand out on request."""
     if not _is_admin(update.effective_user.id):
-        return
+        return await _deny(update, context)
     status = await LiveMessage.reply_to(update.message, "Exporting the database...")
     try:
         data = await asyncio.to_thread(dump_database_csv_zip)
@@ -502,7 +552,7 @@ async def messageas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot. Only works if the user has messaged the bot before (Telegram
     doesn't let bots cold-message anyone). Owner-only for obvious reasons."""
     if not _is_admin(update.effective_user.id):
-        return
+        return await _deny(update, context)
 
     if len(context.args) < 2 or not context.args[0].lstrip("-").isdigit():
         await update.message.reply_text("Usage: /messageas <user_id> <message text>")
@@ -522,7 +572,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     process started, and active-user counts. Owner-only, same reasoning as
     /dbdump: this is operational info, not something every user should see."""
     if not _is_admin(update.effective_user.id):
-        return
+        return await _deny(update, context)
     now = datetime.now(timezone.utc)
     users_hour = await asyncio.to_thread(count_active_users_since, now - timedelta(hours=1))
     users_since_start = await asyncio.to_thread(count_active_users_since, START_TIME)
@@ -535,10 +585,15 @@ async def _blocked_list_text_and_kb(owner_id: int, lang: str):
         return i18n.t(lang, "blocked_none"), None
     lines = [i18n.t(lang, "blocked_header")]
     kb = []
-    for follower_id, conv_numbers in rows:
+    for conversation_id, conv_numbers in rows:
         # Conversation numbers instead of a pseudonym: the owner has seen
         # these in their own chat, and unlike a stable hash they say nothing
         # about the guest beyond "we spoke, in this thread".
+        #
+        # The button is addressed by conversation id, never by the guest's
+        # Telegram user id. Callback data travels to the client as part of
+        # the keyboard, so a user id in it is a user id published -- see
+        # list_anon_blocks_with_conversations.
         if conv_numbers:
             joined = ", ".join(f"#{n}" for n in conv_numbers)
             line = i18n.t(lang, "blocked_guest_line", conversations=joined)
@@ -547,8 +602,9 @@ async def _blocked_list_text_and_kb(owner_id: int, lang: str):
             line = i18n.t(lang, "blocked_guest_line_unknown")
             button = i18n.t(lang, "blocked_unblock_button_unknown")
         lines.append(line)
-        kb.append([InlineKeyboardButton(button, callback_data=f"aq_unblockg:{follower_id}")])
-    return "\n".join(lines), InlineKeyboardMarkup(kb)
+        if conversation_id is not None:
+            kb.append([InlineKeyboardButton(button, callback_data=f"aq_unblockg:{conversation_id}")])
+    return "\n".join(lines), InlineKeyboardMarkup(kb) if kb else None
 
 
 async def blocked_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -587,8 +643,13 @@ async def reply_button_callback(update: Update, context: ContextTypes.DEFAULT_TY
     # owner's next message is a reply-to THIS prompt specifically, so
     # handle_message() below resolves the right conversation regardless of
     # tap order -- no fragile "last button tapped" state involved.
+    #
+    # Marked as a prompt, because that is what lets handle_message delete it
+    # again the moment it has been answered. It is scaffolding, not part of
+    # the conversation: it exists to pin the reply box, and once the reply is
+    # written it has nothing left to say and should not stay in the chat.
     await asyncio.to_thread(
-        record_anon_relays, user_id, [prompt.message_id], conversation_id
+        record_anon_relays, user_id, [prompt.message_id], conversation_id, True
     )
     remember_force_reply(context, prompt)
 
@@ -603,18 +664,22 @@ async def block_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await asyncio.to_thread(set_anon_blocked, conv["owner_user_id"], conv["follower_user_id"], True)
-    await query.answer(i18n.t(lang, "blocked_answer"))
+    # One tap, one answer. This used to fire the toast AND send a separate
+    # "Conversation #N is blocked" message underneath -- two notifications
+    # for one deliberate action, in a chat this bot already writes into more
+    # than it needs to. The toast says it happened; the button now says it is
+    # still true, which is the part the owner comes back and looks for.
+    await query.answer(i18n.t(lang, "blocked_answer"), show_alert=False)
     kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(i18n.t(lang, "unblock_button"), callback_data=f"aq_unblockc:{conversation_id}")]]
+        [[InlineKeyboardButton(
+            i18n.t(lang, "unblock_button_labelled", conv_number=conv["conv_number"]),
+            callback_data=f"aq_unblockc:{conversation_id}",
+        )]]
     )
     try:
         await query.edit_message_reply_markup(reply_markup=kb)
     except BadRequest:
         pass
-    await context.bot.send_message(
-        chat_id=update.effective_user.id,
-        text=i18n.t(lang, "blocked_notice", conv_number=conv["conv_number"]),
-    )
 
 
 async def unblock_from_conversation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -635,11 +700,17 @@ async def unblock_from_conversation_callback(update: Update, context: ContextTyp
 
 
 async def unblock_from_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The /blocked list's own Undo. Addressed by conversation, and the guest
+    behind it is looked up here rather than carried in the button."""
     query = update.callback_query
     lang = await i18n.get_lang(update.effective_user.id, context)
-    follower_id = int(query.data.split(":", 1)[1])
+    conversation_id = int(query.data.split(":", 1)[1])
     owner_id = update.effective_user.id
-    await asyncio.to_thread(set_anon_blocked, owner_id, follower_id, False)
+    conv = await asyncio.to_thread(get_conversation, conversation_id)
+    if not conv or conv["owner_user_id"] != owner_id:
+        await query.answer(i18n.t(lang, "not_your_conversation"), show_alert=True)
+        return
+    await asyncio.to_thread(set_anon_blocked, owner_id, conv["follower_user_id"], False)
     await query.answer(i18n.t(lang, "unblocked_answer"))
     text, kb = await _blocked_list_text_and_kb(owner_id, lang)
     await edit_in_place(query.message, context.bot, text, reply_markup=kb)
@@ -737,6 +808,48 @@ async def send_anyway_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ---------- the actual message routing: owner replies vs. follower questions ----------
 
+# An album is several updates, not one. Telegram sends each photo of a media
+# group as its own message with a shared media_group_id, so a three-photo
+# album used to arrive as three headed bubbles, three Reply/Block rows and
+# three "Sent" confirmations. The first part of a group says all of that; the
+# rest ride in quietly underneath it. Kept in memory and only for a moment,
+# because that is exactly how long the parts take to arrive.
+_ALBUM_WINDOW = 20  # seconds
+_albums: "dict[str, float]" = {}
+
+
+def _album_continuation(message) -> bool:
+    """True when this is a later part of an album whose first part has
+    already been announced."""
+    group = getattr(message, "media_group_id", None)
+    if not group:
+        return False
+    now = datetime.now(timezone.utc).timestamp()
+    for key, seen in list(_albums.items()):
+        if now - seen > _ALBUM_WINDOW:
+            del _albums[key]
+    first_seen = _albums.get(group)
+    _albums[group] = now
+    return first_seen is not None
+
+
+async def _refuse_if_updating(message, lang: str, user_id: int, chat_id: int) -> bool:
+    """Whether an announced update means this message should not be relayed
+    now. Says so and writes the person down when it does.
+
+    A relay is quick, but it is still a write into a database an update may
+    be in the middle of migrating -- and the point of the owner announcing an
+    update in advance is that people hear about it before it lands rather
+    than afterwards. AnonBot had none of these checks at all: /pause reached
+    it, set the flag correctly, and nothing ever asked.
+    """
+    refusal = await refuse_new_work(lang, user_id, chat_id)
+    if refusal:
+        await message.reply_text(refusal)
+        return True
+    return False
+
+
 async def _deliver_follower_message(update: Update, context: ContextTypes.DEFAULT_TYPE, active: dict, message=None):
     """`message` is normally the one that just arrived; the Send-it-anyway
     button passes the earlier, held one instead."""
@@ -744,6 +857,15 @@ async def _deliver_follower_message(update: Update, context: ContextTypes.DEFAUL
     follower = update.effective_user
     owner_id = active["owner_user_id"]
     follower_lang = await i18n.get_lang(follower.id, context)
+    quiet = _album_continuation(message)
+
+    if not quiet:
+        wait = message_allowed(follower.id)
+        if wait:
+            await message.reply_text(i18n.t(follower_lang, "too_fast", seconds=wait))
+            return
+        if await _refuse_if_updating(message, follower_lang, follower.id, message.chat_id):
+            return
 
     # "Is the sender blocked, does the inbox still exist, and what language
     # does the owner read?" -- one query, where it used to be three separate
@@ -760,8 +882,8 @@ async def _deliver_follower_message(update: Update, context: ContextTypes.DEFAUL
 
 
     owner_lang = owner_lang or "en"
-    header = i18n.t(owner_lang, "incoming_header", conv_number=active["conv_number"])
-    kb = _incoming_keyboard(active["id"], owner_lang)
+    header = None if quiet else i18n.t(owner_lang, "incoming_header", conv_number=active["conv_number"])
+    kb = None if quiet else _incoming_keyboard(active["id"], owner_lang)
 
     try:
         sent = await relay_content(
@@ -788,10 +910,13 @@ async def _deliver_follower_message(update: Update, context: ContextTypes.DEFAUL
     if active.get("follower_first_msg_at") is None:
         await asyncio.to_thread(mark_follower_opened, active["id"])
 
-    await message.reply_text(i18n.t(follower_lang, "sent_confirmation"))
-    nudge = await maybe_donation_nudge(follower.id, follower_lang)
-    if nudge:
-        await message.reply_text(nudge)
+    # One confirmation per album, not one per photo.
+    if not quiet:
+        await message.reply_text(i18n.t(follower_lang, "sent_confirmation"))
+    # No donation nudge on this side. A guest did not choose this bot -- they
+    # tapped somebody's link -- and asking them to fund it is asking the
+    # wrong person. The owner is nudged instead, once per conversation; see
+    # _deliver_owner_reply.
 
 
 async def _deliver_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, conversation_id: int):
@@ -806,14 +931,24 @@ async def _deliver_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text(i18n.t(owner_lang, "reply_no_match"))
         return
 
+    quiet = _album_continuation(message)
+    if not quiet:
+        wait = message_allowed(owner.id)
+        if wait:
+            await message.reply_text(i18n.t(owner_lang, "too_fast", seconds=wait))
+            return
+        if await _refuse_if_updating(message, owner_lang, owner.id, message.chat_id):
+            return
+
     follower_id = conv["follower_user_id"]
     follower_lang = await asyncio.to_thread(get_user_language, follower_id) or "en"
     try:
         sent = await relay_content(
             context.bot, message, follower_id,
             reply_to_message_id=conv.get("last_follower_msg_id"),
-            header=i18n.t(follower_lang, "incoming_header_follower", conv_number=conv["conv_number"]),
-            reply_markup=_follower_keyboard(conversation_id, follower_lang),
+            header=None if quiet else i18n.t(
+                follower_lang, "incoming_header_follower", conv_number=conv["conv_number"]),
+            reply_markup=None if quiet else _follower_keyboard(conversation_id, follower_lang),
         )
     except Forbidden:
         await message.reply_text(i18n.t(owner_lang, "reply_forbidden"))
@@ -838,10 +973,17 @@ async def _deliver_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYP
         record_anon_relays, follower_id, [m.message_id for m in sent], conversation_id
     )
 
-    await message.reply_text(i18n.t(owner_lang, "delivered_confirmation"))
-    nudge = await maybe_donation_nudge(owner.id, owner_lang)
-    if nudge:
-        await message.reply_text(nudge)
+    if not quiet:
+        await message.reply_text(i18n.t(owner_lang, "delivered_confirmation"))
+    # Once per conversation, on the owner's first answer in it -- not once per
+    # message. maybe_donation_nudge counts the times it is called, and in the
+    # other bots one call is one whole conversion or download. Here it was one
+    # chat message, so a pair holding an ordinary back-and-forth were shown a
+    # donation pitch three messages in and then every few days.
+    if conv.get("last_owner_msg_id") is None:
+        nudge = await maybe_donation_nudge(owner.id, owner_lang)
+        if nudge:
+            await message.reply_text(nudge)
 
 
 async def _reply_prompt_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -859,11 +1001,22 @@ async def _reply_prompt_pending(update: Update, context: ContextTypes.DEFAULT_TY
     if replied_to is None:
         context.user_data.pop("cancel_reply_prompt", None)
         return False
-    pending = bool(await asyncio.to_thread(
+    # A prompt, specifically -- not merely a message this bot is tracking.
+    # Every relayed message in the chat has a relay row, so the old check
+    # offered to cancel "the reply you were writing" whenever /cancel was
+    # sent as a reply to any of them, with nothing actually pending.
+    _, is_prompt = await asyncio.to_thread(
         get_conversation_for_relay, update.effective_chat.id, replied_to.message_id
-    ))
-    context.user_data["cancel_reply_prompt"] = pending
-    return pending
+    )
+    if is_prompt:
+        # And it is *this* prompt /cancel means, whichever one was sent last.
+        # remember_force_reply keeps one id per user, so with two Reply
+        # buttons tapped and the first one cancelled, the id in user_data
+        # named the second: the wrong prompt came down and the one being
+        # backed out of stayed pinned to the reply box.
+        context.user_data[FORCE_REPLY_KEY] = replied_to.message_id
+    context.user_data["cancel_reply_prompt"] = is_prompt
+    return is_prompt
 
 
 async def _cancel_items(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str) -> list[CancelItem]:
@@ -929,6 +1082,63 @@ async def cancel_choice_callback(update: Update, context: ContextTypes.DEFAULT_T
     await finish_cancel_choice(update, context, lang, stopped)
 
 
+async def _retire_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int, prompt_id: int) -> None:
+    """Take the Reply prompt back down, now that it has been answered.
+
+    The prompt is scaffolding. It exists for one reason -- Telegram's
+    ForceReply has to hang off a real message, and that is the only way to
+    guarantee the next thing typed is aimed at one specific conversation --
+    and the moment the reply arrives it has nothing left to do. Leaving it
+    meant every answer cost two bot messages in the chat: "Replying in
+    conversation #6, to: ..." and then "Delivered". Now it costs one, and
+    the one it costs is the one that says the message actually went.
+
+    Nothing is lost by removing it. Which conversation the reply belonged to
+    was read out of anon_relay before this runs, so the routing has already
+    happened; the prompt's own row goes with it so nothing is left pointing
+    at a message that no longer exists. Best-effort throughout -- a prompt
+    that cannot be deleted (over Telegram's 48-hour limit, or already gone)
+    is not a reason to fail the reply it was asking for.
+    """
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=prompt_id)
+    except Exception:
+        logger.debug("Could not remove an answered reply prompt", exc_info=True)
+    else:
+        await asyncio.to_thread(forget_anon_relay, chat_id, prompt_id)
+    if context.user_data.get(FORCE_REPLY_KEY) == prompt_id:
+        context.user_data.pop(FORCE_REPLY_KEY, None)
+    context.user_data.pop("cancel_reply_prompt", None)
+
+
+async def edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Editing a message that has already been relayed changes nothing on the
+    other side, and saying nothing let people believe it had.
+
+    A bot cannot edit a message it copied into somebody else's chat back into
+    a new shape -- copy_message makes an independent message, and the other
+    person has very likely already read it. So the honest answer is to say
+    what happened, once, and point at the thing that does work.
+
+    Registered in group -1 and always ends by stopping the update, because
+    asking Telegram for edits at all (allowed_updates) means every handler
+    below this one starts seeing them: python-telegram-bot matches a
+    MessageHandler -- and a CommandHandler -- on effective_message, which is
+    the edited message, while update.message is None. Nothing downstream is
+    written for that, and nothing downstream has any use for an edit.
+    """
+    edited = update.edited_message
+    try:
+        conversation_id, _ = await asyncio.to_thread(
+            get_conversation_for_relay, update.effective_chat.id, edited.message_id
+        )
+        if conversation_id is not None:
+            lang = await i18n.get_lang(update.effective_user.id, context)
+            await edited.reply_text(i18n.t(lang, "edit_not_relayed"))
+    finally:
+        raise ApplicationHandlerStop
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user = update.effective_user
@@ -951,26 +1161,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #    open session with, which is exactly how a stray reply on old chat
     #    history could otherwise land somewhere unintended).
     if message.reply_to_message:
-        conversation_id = await asyncio.to_thread(
-            get_conversation_for_relay, chat_id, message.reply_to_message.message_id
+        anchor_id = message.reply_to_message.message_id
+        conversation_id, was_prompt = await asyncio.to_thread(
+            get_conversation_for_relay, chat_id, anchor_id
         )
         if conversation_id:
             # Both chats carry relay rows now, so a matched row says *which*
             # conversation, not which direction. The sender's own id is what
             # says that -- owner one way, guest the other.
             conv = await asyncio.to_thread(get_conversation, conversation_id)
-            if conv and conv["owner_user_id"] == user.id:
-                return await _deliver_owner_reply(update, context, conversation_id)
-            if conv and conv["follower_user_id"] == user.id:
-                active = await asyncio.to_thread(get_active_conversation_for_follower, user.id)
-                if active and active["id"] == conversation_id:
-                    return await _deliver_follower_message(update, context, active)
-                # Replying inside a conversation the guest has since moved on
-                # from (tapping the link again starts a new one) would put the
-                # message somewhere they are not looking. Say so.
-                lang = await i18n.get_lang(user.id, context)
-                await message.reply_text(i18n.t(lang, "reply_stale"))
-                return
+            if conv and user.id in (conv["owner_user_id"], conv["follower_user_id"]):
+                if was_prompt:
+                    await _retire_prompt(context, chat_id, anchor_id)
+                if conv["owner_user_id"] == user.id:
+                    return await _deliver_owner_reply(update, context, conversation_id)
+                # A guest replying. This used to be allowed only into the one
+                # conversation anon_follower_state happened to point at --
+                # which every link tap overwrites, so tapping any inbox link
+                # silently ended the guest's ability to answer everything
+                # they already had. The Reply buttons under those older
+                # messages stayed on screen and kept failing, and the message
+                # they got back blamed the age of the message rather than the
+                # tap. The relay row is the authority on which conversation a
+                # reply belongs to, it resolved correctly the whole time, and
+                # the owner was never held to this rule. Now neither side is:
+                # anon_follower_state says where an UN-replied message goes,
+                # and nothing more.
+                return await _deliver_follower_message(update, context, conv)
         lang = await i18n.get_lang(user.id, context)
         await message.reply_text(i18n.t(lang, "reply_stale"))
         return
@@ -986,11 +1203,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #    owner answering a new arrival, while still holding an open session
     #    from a link they had tapped themselves, had their answer delivered
     #    to that other conversation entirely -- and told "Sent".
-    active = await asyncio.to_thread(get_active_conversation_for_follower, user.id)
-    if active and active.get("follower_first_msg_at") is None:
+    routing = await asyncio.to_thread(get_routing_context, user.id, chat_id)
+    active, owned = routing["active"], routing["owned"]
+
+    # The exemption is spent on the conversation, and only while there is
+    # genuinely nothing else in this chat the message could have been meant
+    # for. It used to rest on follower_first_msg_at alone, which made it a
+    # property of the newest conversation rather than of the chat -- so a
+    # guest who was mid-conversation with one person, tapped a second link,
+    # and then typed an answer to the first had it delivered to the second as
+    # an opening message, and was told "Sent". That is the wrong-recipient
+    # failure the reply rule exists to prevent; it was closed for owners in
+    # 1.0.0 and left open here.
+    if active and active.get("follower_first_msg_at") is None and not routing["other_threads"]:
         return await _deliver_follower_message(update, context, active)
 
-    owned = await asyncio.to_thread(count_owner_conversations, user.id)
     if active or owned:
         lang = await i18n.get_lang(user.id, context)
         # One open session and no inbox of their own is the only case with a
@@ -1040,6 +1267,11 @@ def main():
     lifecycle.install(app, BOT_NAME)
     app.add_error_handler(error_handler)
     app.add_handler(TypeHandler(Update, track_activity), group=-1)
+    # Answered here and stopped here -- see edited_message. Registered after
+    # track_activity so an edit still counts as activity and still moves
+    # live_message's watermark, and before everything else so no handler
+    # written for update.message ever receives an update that has none.
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, edited_message), group=-1)
     # Runs after track_activity but before every other handler (including the
     # anonymous-relay handle_message below) -- a no-op unless a "Custom" donate
     # button was just tapped, in which case it consumes the reply and stops it
@@ -1104,7 +1336,10 @@ def main():
     # stops sending the rest rather than this process parsing and dropping it.
     app.run_polling(**lifecycle.polling_kwargs(
         timeout=POLL_TIMEOUT,
-        allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY, Update.PRE_CHECKOUT_QUERY],
+        allowed_updates=[
+            Update.MESSAGE, Update.EDITED_MESSAGE,
+            Update.CALLBACK_QUERY, Update.PRE_CHECKOUT_QUERY,
+        ],
     ))
 
 

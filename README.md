@@ -71,16 +71,32 @@ everyone else):
   prompt, resolves through this lookup rather than through "whichever button
   was tapped most recently", so it is correct even with several Reply prompts
   outstanding at once. A matched row says which *conversation*; the sender's
-  own id says which *direction*.
+  own id says which *direction*. It is the **only** thing consulted for a
+  reply: both sides can answer any conversation they are a party to, for as
+  long as the row lives (180 days of conversation silence). `is_prompt` marks
+  the Reply button's own prompt, which is deleted once it has been answered.
+- **`anon_follower_state` is about un-replied messages only.** It is one row
+  per person, rewritten by every link tap, and it says where a message that
+  names nothing should go. Until v1.1.1 it also gated *replies*, so tapping
+  any inbox link silently ended a guest's ability to answer everything they
+  already had — while the Reply buttons under those messages stayed on screen
+  and kept failing. The owner was never held to that rule; now neither side
+  is.
 - **Every message says what it answers, except the one that opens a thread.**
   Exactly one message per conversation may be sent without naming what it
   replies to: the guest's opening one, which has nothing above it —
-  `follower_first_msg_at` marks that exemption spent. Everything after it,
-  from either side, has to be a reply. A link is posted somewhere public and
-  one person ends up answering several, so "whichever thread was touched most
-  recently" is not a guess worth making: an owner who was also mid-session
-  with somebody else's inbox used to have their answer delivered to that other
-  conversation entirely, and be told "Sent".
+  `follower_first_msg_at` marks that exemption spent. It also has to be the
+  only thing in the chat: with another live conversation present the message
+  is held, because "the newest conversation is empty" says nothing about which
+  thread the words were meant for. Everything else, from either side, has to
+  be a reply. A link is posted somewhere public and one person ends up
+  answering several, so "whichever thread was touched most recently" is not a
+  guess worth making: an owner who was also mid-session with somebody else's
+  inbox used to have their answer delivered to that other conversation
+  entirely, and be told "Sent" — and so, until v1.1.1, did a guest.
+- **Nobody is told a message went somewhere it did not.** Where the
+  destination is genuinely unambiguous a held message gets a *Send it anyway*
+  button; where it is not, the bot says so and sends nothing.
 - **The way past it, only where it cannot go wrong.** A held message gets a
   *Send it anyway* button when there is exactly one place it could have gone —
   an open session and no inbox of your own. With several conversations in play

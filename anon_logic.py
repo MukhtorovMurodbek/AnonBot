@@ -16,9 +16,20 @@ both arrive in the same bubble stream, that one difference is what tells you
 at a glance which words are somebody else's.
 """
 import html
+import os
+import time
+from collections import OrderedDict, deque
 
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
+
+# Telegram's own ceilings, and a little room. The limits are on the *parsed*
+# text, so measuring the escaped-and-tagged string over-counts -- which is the
+# direction to be wrong in: an occasional early split costs a second bubble,
+# and getting it wrong the other way costs the message entirely.
+TEXT_LIMIT = 4096
+CAPTION_LIMIT = 1024
+SAFETY = 24
 
 
 def italicize(text: str) -> str:
@@ -26,6 +37,95 @@ def italicize(text: str) -> str:
     types <b>hi</b> should see <b>hi</b> arrive, not bold text, and should
     certainly not be able to close the tag this wraps them in."""
     return f"<i>{html.escape(text)}</i>"
+
+
+def split_to_fit(body: str, first_budget: int, later_budget: int) -> list[str]:
+    """`body` cut into pieces that will each survive escaping, preferring to
+    break at a newline and then at a space.
+
+    A header costs characters the sender never sees, so a guest who filled
+    their message box exactly to Telegram's limit used to have the whole
+    thing rejected -- and be told "Couldn't deliver that message: Message is
+    too long", which reads as their fault. Splitting says everything they
+    wrote, in the order they wrote it.
+    """
+    pieces: list[str] = []
+    rest = body
+    budget = first_budget
+    while rest:
+        if len(html.escape(rest)) <= budget:
+            pieces.append(rest)
+            break
+        # Walk back from the largest slice that could possibly fit until the
+        # escaped form does, then back further to a sensible break.
+        cut = budget
+        while cut > 1 and len(html.escape(rest[:cut])) > budget:
+            cut -= max(1, (len(html.escape(rest[:cut])) - budget) // 4 + 1)
+        window = rest[:cut]
+        at = max(window.rfind("\n"), window.rfind(" "))
+        if at > cut // 2:
+            cut = at + 1
+        pieces.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+        budget = later_budget
+    return [p for p in pieces if p] or [body]
+
+
+# ---------------------------------------------------------------------------
+# Flood control
+# ---------------------------------------------------------------------------
+# An inbox link is meant to be posted somewhere public, and until now nothing
+# at all bounded how fast a stranger could write into it: Block was the only
+# defence, and Block is per Telegram account. This is deliberately in memory
+# rather than in the database -- one process holds the polling lease, so there
+# is exactly one counter to keep, and paying a round trip to a database in
+# another continent on every message to enforce a per-minute limit would cost
+# more than the limit saves. A redeploy forgets it, which is the right way to
+# fail: the worst case is one burst getting through after a restart.
+
+MSGS_PER_MINUTE = int(os.environ.get("ABOT_MSGS_PER_MINUTE", "20"))
+NEW_CONV_COOLDOWN = int(os.environ.get("ABOT_NEW_CONV_COOLDOWN_SEC", "30"))
+_MAX_TRACKED = 4096
+
+_recent_messages: "OrderedDict[int, deque]" = OrderedDict()
+_recent_opens: "OrderedDict[int, float]" = OrderedDict()
+
+
+def _trim(store) -> None:
+    while len(store) > _MAX_TRACKED:
+        store.popitem(last=False)
+
+
+def message_allowed(user_id: int) -> int:
+    """0 if this person may send now, otherwise the whole seconds to wait."""
+    if MSGS_PER_MINUTE <= 0:
+        return 0
+    now = time.monotonic()
+    window = _recent_messages.setdefault(user_id, deque())
+    _recent_messages.move_to_end(user_id)
+    _trim(_recent_messages)
+    while window and now - window[0] > 60:
+        window.popleft()
+    if len(window) >= MSGS_PER_MINUTE:
+        return max(1, int(60 - (now - window[0])) + 1)
+    window.append(now)
+    return 0
+
+
+def new_conversation_allowed(user_id: int) -> int:
+    """0 if this person may open another conversation now, otherwise the
+    whole seconds to wait. Tapping a link is cheap for the tapper and costs
+    the owner a row and a notification each time."""
+    if NEW_CONV_COOLDOWN <= 0:
+        return 0
+    now = time.monotonic()
+    last = _recent_opens.get(user_id)
+    if last is not None and now - last < NEW_CONV_COOLDOWN:
+        return max(1, int(NEW_CONV_COOLDOWN - (now - last)) + 1)
+    _recent_opens[user_id] = now
+    _recent_opens.move_to_end(user_id)
+    _trim(_recent_opens)
+    return 0
 
 
 async def relay_content(
@@ -98,11 +198,44 @@ async def relay_content(
                 )
             raise
 
+    header_cost = len(html.escape(header)) + 2 if header else 0
+
+    def _pieces(body: str, limit: int) -> list[str]:
+        return split_to_fit(body, limit - header_cost - SAFETY, limit - SAFETY)
+
     if message.text is not None:
-        return [await _send_text(_compose(message.text), reply_to_message_id, reply_markup)]
+        parts = _pieces(message.text, TEXT_LIMIT)
+        sent = []
+        for n, part in enumerate(parts):
+            # The header goes on the first bubble only, and the buttons on the
+            # last, so a message split in three still reads as one thing with
+            # one Reply button under the end of it.
+            text = _compose(part) if n == 0 else italicize(part)
+            sent.append(await _send_text(
+                text,
+                reply_to_message_id if n == 0 else None,
+                reply_markup if n == len(parts) - 1 else None,
+            ))
+        return sent
 
     if message.caption is not None:
-        return [await _copy(reply_to_message_id, reply_markup, caption=_compose(message.caption))]
+        composed = _compose(message.caption)
+        if len(composed) <= CAPTION_LIMIT:
+            return [await _copy(reply_to_message_id, reply_markup, caption=composed)]
+        # Too long to ride along under the picture. The words go above it as
+        # their own bubbles and the media follows, carrying the buttons --
+        # which is the same shape uncaptioned media already uses, and beats
+        # either truncating what somebody wrote or refusing the whole thing.
+        parts = _pieces(message.caption, TEXT_LIMIT)
+        sent = []
+        for n, part in enumerate(parts):
+            sent.append(await _send_text(
+                _compose(part) if n == 0 else italicize(part),
+                reply_to_message_id if n == 0 else None,
+                None,
+            ))
+        sent.append(await _copy(None, reply_markup))
+        return sent
 
     sent = []
     if header:

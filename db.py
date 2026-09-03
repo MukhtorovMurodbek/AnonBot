@@ -297,6 +297,14 @@ def init_db(dsn: str = DATABASE_URL) -> None:
             )
             """
         )
+        # True for the Reply button's ForceReply prompt, and only for that.
+        # The prompt is scaffolding: it exists to pin the reply box to one
+        # conversation, and once the reply it asked for has arrived it has
+        # nothing left to say. Knowing which rows are prompts is what lets
+        # bot.py take them back down again -- and it has to be knowable from
+        # the database rather than from user_data, because the tap and the
+        # reply can land in different processes.
+        conn.execute("ALTER TABLE anon_relay ADD COLUMN IF NOT EXISTS is_prompt BOOLEAN NOT NULL DEFAULT FALSE")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS anon_blocks (
@@ -581,10 +589,20 @@ def start_new_anon_conversation(owner_user_id: int, follower_user_id: int) -> di
     the follower's active-routing state at it, so their very next un-replied
     message lands here instead of wherever they left off before."""
     with pooled() as conn:
+        # Numbered per OWNER, not per (owner, follower) pair. The number is
+        # the only thing either side is ever told about a thread, and per-pair
+        # numbering restarted it at 1 for every new person -- so three
+        # different strangers all arrived in the owner's chat as
+        # "Conversation #1", and /blocked listed two separate guests both
+        # described as "#1". Existing rows are left exactly as they are: the
+        # owner has already read those numbers in their own chat and
+        # renumbering would rewrite what they saw. Because this takes the
+        # owner's highest number rather than the pair's, every number issued
+        # from here on is above all of them, so no NEW collision can appear.
         cur = conn.execute(
             "SELECT COALESCE(MAX(conv_number), 0) FROM anon_conversations "
-            "WHERE owner_user_id = %s AND follower_user_id = %s",
-            (owner_user_id, follower_user_id),
+            "WHERE owner_user_id = %s",
+            (owner_user_id,),
         )
         conv_number = cur.fetchone()[0] + 1
         now = datetime.now(timezone.utc).isoformat()
@@ -664,23 +682,38 @@ def get_conversation(conversation_id: int) -> dict | None:
 
 
 
-def record_anon_relays(chat_id: int, message_ids, conversation_id: int) -> None:
+def record_anon_relays(chat_id: int, message_ids, conversation_id: int, is_prompt: bool = False) -> None:
     """Remembers 'these messages, in this chat, belong to this conversation'
     so a later reply -- a native swipe-reply, or the Reply button's forced
     reply prompt -- can be traced back to the right thread even with many
     conversations interleaved in the same chat.
 
     Takes a list because a media message with a header goes out as two, and
-    both are valid reply anchors; one statement covers however many."""
+    both are valid reply anchors; one statement covers however many.
+
+    `is_prompt` marks the Reply button's own prompt, which is the one kind of
+    row that is meant to be deleted again once it has been answered."""
     ids = list(message_ids)
     if not ids:
         return
     with pooled() as conn:
         conn.execute(
-            "INSERT INTO anon_relay (chat_id, message_id, conversation_id) "
-            "SELECT %s, unnest(%s::bigint[]), %s "
-            "ON CONFLICT (chat_id, message_id) DO UPDATE SET conversation_id = excluded.conversation_id",
-            (chat_id, ids, conversation_id),
+            "INSERT INTO anon_relay (chat_id, message_id, conversation_id, is_prompt) "
+            "SELECT %s, unnest(%s::bigint[]), %s, %s "
+            "ON CONFLICT (chat_id, message_id) DO UPDATE SET "
+            "conversation_id = excluded.conversation_id, is_prompt = excluded.is_prompt",
+            (chat_id, ids, conversation_id, is_prompt),
+        )
+        conn.commit()
+
+
+def forget_anon_relay(chat_id: int, message_id: int) -> None:
+    """Drop one relay row -- for a Reply prompt that has been answered and
+    deleted, so nothing is left pointing at a message that no longer exists."""
+    with pooled() as conn:
+        conn.execute(
+            "DELETE FROM anon_relay WHERE chat_id = %s AND message_id = %s",
+            (chat_id, message_id),
         )
         conn.commit()
 
@@ -700,9 +733,10 @@ def record_relay_and_touch(
     with pooled() as conn:
         if ids:
             conn.execute(
-                "INSERT INTO anon_relay (chat_id, message_id, conversation_id) "
-                "SELECT %s, unnest(%s::bigint[]), %s "
-                "ON CONFLICT (chat_id, message_id) DO UPDATE SET conversation_id = excluded.conversation_id",
+                "INSERT INTO anon_relay (chat_id, message_id, conversation_id, is_prompt) "
+                "SELECT %s, unnest(%s::bigint[]), %s, FALSE "
+                "ON CONFLICT (chat_id, message_id) DO UPDATE SET "
+                "conversation_id = excluded.conversation_id, is_prompt = FALSE",
                 (chat_id, ids, conversation_id),
             )
         conn.execute(
@@ -726,25 +760,87 @@ def mark_follower_opened(conversation_id: int) -> None:
 
 
 def count_owner_conversations(owner_user_id: int) -> int:
-    """How many conversations this user is the inbox owner of. A bare message
-    from someone with any at all is ambiguous -- it could be meant for any of
-    them -- which is exactly what the reply rule exists to resolve."""
+    """How many conversations this user is the inbox owner of, counting only
+    the ones something was actually said in. A bare message from someone with
+    any at all is ambiguous -- it could be meant for any of them -- which is
+    exactly what the reply rule exists to resolve.
+
+    A link tap creates a row whether or not the guest ever writes, so counting
+    rows counted people who opened the link and left. That pushed an owner
+    into the ambiguous branch on the strength of conversations that had never
+    contained a word."""
     with pooled() as conn:
         cur = conn.execute(
-            "SELECT count(*) FROM anon_conversations WHERE owner_user_id = %s",
+            "SELECT count(*) FROM anon_conversations WHERE owner_user_id = %s "
+            "AND (follower_first_msg_at IS NOT NULL OR last_owner_msg_id IS NOT NULL)",
             (owner_user_id,),
         )
         return cur.fetchone()[0]
 
 
-def get_conversation_for_relay(chat_id: int, message_id: int) -> int | None:
+def get_routing_context(user_id: int, chat_id: int) -> dict:
+    """Everything handle_message needs to route one un-replied message, in a
+    single round trip.
+
+    This used to be two queries and, once the opening-message exemption had to
+    start checking for other live threads, would have been three. The database
+    is a long way from the containers -- a bare SELECT 1 measures about a
+    second -- so three sequential round trips on the hot path of every message
+    is the most expensive thing this bot does. All three answers come from
+    different tables and none depends on another, so one statement does.
+
+    Returns:
+      active        -- the conversation an un-replied message would go to, or None
+      owned         -- how many live conversations this user owns an inbox for
+      other_threads -- whether this chat holds any conversation OTHER than
+                       `active` that a message might have been meant for
+    """
     with pooled() as conn:
         cur = conn.execute(
-            "SELECT conversation_id FROM anon_relay WHERE chat_id = %s AND message_id = %s",
+            """
+            WITH state AS (
+                SELECT owner_user_id, conversation_id
+                FROM anon_follower_state WHERE follower_user_id = %(uid)s
+            )
+            SELECT
+              s.owner_user_id, s.conversation_id,
+              c.conv_number, c.last_owner_msg_id, c.last_follower_msg_id, c.follower_first_msg_at,
+              (SELECT count(*) FROM anon_conversations o
+                WHERE o.owner_user_id = %(uid)s
+                  AND (o.follower_first_msg_at IS NOT NULL OR o.last_owner_msg_id IS NOT NULL)),
+              EXISTS (SELECT 1 FROM anon_relay r
+                       WHERE r.chat_id = %(chat)s
+                         AND r.conversation_id IS DISTINCT FROM s.conversation_id)
+            FROM (SELECT 1) AS one
+            LEFT JOIN state s ON TRUE
+            LEFT JOIN anon_conversations c ON c.id = s.conversation_id
+            """,
+            {"uid": user_id, "chat": chat_id},
+        )
+        row = cur.fetchone()
+        owner_id, conversation_id = row[0], row[1]
+        active = None
+        if conversation_id is not None and row[2] is not None:
+            active = {
+                "id": conversation_id, "owner_user_id": owner_id, "follower_user_id": user_id,
+                "conv_number": row[2], "last_owner_msg_id": row[3],
+                "last_follower_msg_id": row[4], "follower_first_msg_at": row[5],
+            }
+        return {"active": active, "owned": row[6] or 0, "other_threads": bool(row[7])}
+
+
+def get_conversation_for_relay(chat_id: int, message_id: int) -> tuple[int | None, bool]:
+    """(conversation_id, was_this_a_reply_prompt) for one message in one chat.
+
+    The second half is what lets bot.py delete a Reply prompt once the reply
+    it asked for has arrived -- see record_anon_relays."""
+    with pooled() as conn:
+        cur = conn.execute(
+            "SELECT conversation_id, is_prompt FROM anon_relay WHERE chat_id = %s AND message_id = %s",
             (chat_id, message_id),
         )
         row = cur.fetchone()
-        return row[0] if row else None
+        return (row[0], bool(row[1])) if row else (None, False)
 
 
 
@@ -782,18 +878,27 @@ def set_anon_blocked(owner_user_id: int, follower_user_id: int, blocked: bool) -
         conn.commit()
 
 
-def list_anon_blocks_with_conversations(owner_user_id: int) -> list[tuple[int, list[int]]]:
-    """Blocked guests, each with the conversation numbers they used.
+def list_anon_blocks_with_conversations(owner_user_id: int) -> list[tuple[int | None, list[int]]]:
+    """Blocked guests, each as (a conversation id to address them by, the
+    conversation numbers they used).
 
     /blocked used to identify people by a hashed pseudonym. Conversation
     numbers do the same job with something the owner has actually seen in
     their chat -- and unlike the pseudonym they carry no identity at all,
     stable or otherwise. One query rather than one per blocked guest.
+
+    The first element used to be the guest's Telegram user id, which bot.py
+    then put in the unblock button's callback_data. Callback data is part of
+    the keyboard Telegram hands to the client, so anything able to read a
+    message's markup could read it -- and in a bot whose whole premise is
+    that the owner never learns who is writing, that is the one field that
+    must not leave the server. A conversation id says the same thing to the
+    bot and nothing at all about the person.
     """
     with pooled() as conn:
         cur = conn.execute(
             """
-            SELECT b.follower_user_id,
+            SELECT MIN(c.id),
                    COALESCE(ARRAY_AGG(c.conv_number ORDER BY c.conv_number)
                             FILTER (WHERE c.conv_number IS NOT NULL), '{}')
             FROM anon_blocks b
@@ -810,9 +915,13 @@ def list_anon_blocks_with_conversations(owner_user_id: int) -> list[tuple[int, l
 
 
 def get_anon_stats(owner_user_id: int) -> dict:
+    """Counts only conversations something was actually said in -- a link tap
+    that never became a message is not a conversation anybody had."""
     with pooled() as conn:
         cur = conn.execute(
-            "SELECT COUNT(DISTINCT follower_user_id), COUNT(*) FROM anon_conversations WHERE owner_user_id = %s",
+            "SELECT COUNT(DISTINCT follower_user_id), COUNT(*) FROM anon_conversations "
+            "WHERE owner_user_id = %s "
+            "AND (follower_first_msg_at IS NOT NULL OR last_owner_msg_id IS NOT NULL)",
             (owner_user_id,),
         )
         distinct_followers, conversations = cur.fetchone()
