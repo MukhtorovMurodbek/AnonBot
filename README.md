@@ -1,192 +1,167 @@
 # AnonBot
 
-Telegram bot for a one-sided anonymous inbox: an **owner** gets one
-permanent link (`/link`) and posts it somewhere public; anyone who taps it
-— a **follower** — can send the owner an anonymous message right there in
-the bot chat. The owner's identity is never hidden (it's their own chat);
-only the follower's is. Both sides answer the same way: reply to the message
-you're answering, by swipe or by the Reply button under it.
+A Telegram bot that gives each of its users a permanent personal link.
+Anyone who opens that link can send the owner an anonymous message, and the
+owner can answer — as a real, threaded, two-way conversation, with the
+sender's identity never revealed to them.
 
-This bot is its own process, its own repo and its own deployment — it can
-be run entirely on its own. It shares one Postgres database with the rest
-of the family, but only in the sense that its tables live in their own
-schema inside it (`DB_SCHEMA` in `.env`); no other bot reads or writes
-them. The exception is `family.*`, where this bot posts a heartbeat and
-any crash so that ParentBot can watch it — see `family_link.py`, and
-ARCHITECTURE.md in the family monorepo for why it is arranged this way. Set `FAMILY_BUS=off`
-to opt out of that entirely.
+The owner is not anonymous; it is their own chat. Only the person writing to
+them is.
+
+Runs as its own process, its own repository and its own deployment, and can
+be run entirely standalone. It shares a Postgres database with four sibling
+bots only in the sense that its tables live in a schema of their own inside
+it (`DB_SCHEMA`); no other bot reads or writes them. The one shared area is
+`family.*`, where the bot posts a heartbeat and any crash so a monitoring bot
+can watch it — `FAMILY_BUS=off` disables that entirely.
+
+---
 
 ## Commands
 
-- `/link` — get your permanent inbox link
-- `/newlink` — reset it (invalidates the old one; conversations already in
-  progress keep working)
-- `/pause` / `/resume` — stop/allow new conversations (open ones keep working)
-- `/blocked` — review + undo who you've blocked
-- `/stats` — distinct-follower and total-conversation counts for your inbox
-- `/donate` — chip in for hosting costs (voluntary, Telegram Stars)
-- `/cancel` — asks which of the things it is waiting on you for to stop,
-  as one button each, and stops nothing until you pick. With nothing pending
-  it says so straight away, as it always did — an open anonymous chat, or a reply
-  it asked you for. Typing /cancel to escape a Reply prompt no longer walks
-  you out of the conversation as well
-- `/start` — the full instructions. The first `/start` from a brand-new
-  user asks for a language before printing them, which is the one and only
-  time it asks; after that it prints them in the language on record. A
-  `/start q_<token>` inbox link goes straight to the inbox either way
-- `/language` — the picker on demand: a short greeting in all three
-  languages and one row of buttons, with a tick on the language in force.
-  Choosing one (even the one already set) reprints the instructions in it
-- `/en`, `/uz`, `/rus` — switch language directly, skipping the picker;
-  each also reprints the instructions in the language just chosen
-- `/help` — the instructions on their own
+| command | what it does |
+|---|---|
+| `/start` | Instructions. The first `/start` from a new user asks which language to use, once; afterwards it prints the instructions in the language on record. |
+| `/link` | The user's permanent inbox link. Carries Pause / Resume and New-link buttons, so the three commands below are rarely typed. |
+| `/newlink` | Issues a new link and invalidates the old one. Conversations already open keep working — they are routed by conversation, not by token. |
+| `/pause`, `/resume` | Stop or allow *new* conversations. Open ones are unaffected. |
+| `/blocked` | Lists blocked senders by conversation number, each with an Undo button. |
+| `/stats` | How many distinct people have written, and how many conversations. |
+| `/cancel` | Asks which of the things the bot is waiting on should stop, one button each, and stops nothing until one is chosen. |
+| `/donate` | Voluntary contribution towards hosting, paid in Telegram Stars. |
+| `/language`, `/en`, `/uz`, `/rus` | Switch language. Each reprints the instructions in the language chosen. |
+| `/help` | The instructions on their own. |
 
-`/link`'s message also carries Pause/Resume and New-link buttons, so the
-common case doesn't need `/pause`/`/resume`/`/newlink` typed out at all.
+Opening somebody's link is `/start q_<token>`, which the bot handles
+automatically; it is not a command anyone types.
 
-Tapping someone's link is `/start q_<token>` — handled automatically, not a
-command you type.
+Three further commands — `/dbdump`, `/messageas` and `/status` — are
+restricted to the account ids in `ABOT_ADMIN_ID`. To everyone else they
+answer exactly as a misspelt command does, so their existence is not
+disclosed.
 
-Owner-only (requires `ABOT_ADMIN_ID` in `.env` — silently do nothing for
-everyone else):
-- `/messageas <user_id> <text>` — send a message to that user as this bot
-- `/dbdump` — export this bot's tables as a zip of CSVs
-- `/status` — uptime, host, crashes since this process started, active users
+---
 
-## How the threading works (for anyone reading the code)
+## How a conversation is routed
 
-- **Conversations, not just messages** (`anon_conversations`): every time
-  someone taps an owner's link, that's a brand-new row — tapping the same
-  link again *always* starts a fresh conversation, never continues an old
-  one. `conv_number` counts per (owner, follower) pair.
-- **Reply-threading, both directions** (`anon_logic.relay_content()`):
-  every message relays through `copy_message` (no "Forwarded from" tag)
-  with `reply_to_message_id` set to the relevant rolling anchor, so both
-  sides see a real, visibly-threaded back-and-forth via Telegram's own
-  reply-quote UI — even with several conversations interleaved in the same
-  chat.
-- **Knowing which reply goes where** (`anon_relay`): every message this bot
-  delivers — into either chat — gets one row here, `(chat_id, message_id) ->
-  conversation_id`. A reply, native swipe or the Reply button's forced
-  prompt, resolves through this lookup rather than through "whichever button
-  was tapped most recently", so it is correct even with several Reply prompts
-  outstanding at once. A matched row says which *conversation*; the sender's
-  own id says which *direction*. It is the **only** thing consulted for a
-  reply: both sides can answer any conversation they are a party to, for as
-  long as the row lives (180 days of conversation silence). `is_prompt` marks
-  the Reply button's own prompt, which is deleted once it has been answered.
-- **`anon_follower_state` is about un-replied messages only.** It is one row
-  per person, rewritten by every link tap, and it says where a message that
-  names nothing should go. Until v1.1.1 it also gated *replies*, so tapping
-  any inbox link silently ended a guest's ability to answer everything they
-  already had — while the Reply buttons under those messages stayed on screen
-  and kept failing. The owner was never held to that rule; now neither side
-  is.
-- **Every message says what it answers, except the one that opens a thread.**
-  Exactly one message per conversation may be sent without naming what it
-  replies to: the guest's opening one, which has nothing above it —
-  `follower_first_msg_at` marks that exemption spent. It also has to be the
-  only thing in the chat: with another live conversation present the message
-  is held, because "the newest conversation is empty" says nothing about which
-  thread the words were meant for. Everything else, from either side, has to
-  be a reply. A link is posted somewhere public and one person ends up
-  answering several, so "whichever thread was touched most recently" is not a
-  guess worth making: an owner who was also mid-session with somebody else's
-  inbox used to have their answer delivered to that other conversation
-  entirely, and be told "Sent" — and so, until v1.1.1, did a guest.
-- **Nobody is told a message went somewhere it did not.** Where the
-  destination is genuinely unambiguous a held message gets a *Send it anyway*
-  button; where it is not, the bot says so and sends nothing.
-- **The way past it, only where it cannot go wrong.** A held message gets a
-  *Send it anyway* button when there is exactly one place it could have gone —
-  an open session and no inbox of your own. With several conversations in play
-  the bot says so and sends nothing, rather than making by button the same
-  guess the rule exists to stop.
-- **Whose words are whose** (`anon_logic.italicize()`): everything a person
-  wrote arrives in italics; everything the bot says for itself stays upright.
-  Both land in the same chat, and that one difference is what separates them
-  at a glance.
-- **No pseudonyms.** Messages and `/blocked` identify a thread by its
-  conversation number only. Nothing shown to either side is derived from the
-  other's account.
+The problem this bot solves is that one person's inbox link is posted
+somewhere public, so a single chat ends up holding conversations with many
+different strangers at once. Every message therefore has to say which
+conversation it belongs to, and the bot has to be certain before it delivers
+anything — a message sent to the wrong stranger is the one failure that
+cannot be taken back.
 
-## Setup
+**Every message is a reply, and Telegram's own reply feature is what says
+so.** A swipe-reply and the ↩️ Reply button under each message resolve
+identically: both produce a Telegram reply, which carries the id of the
+message being answered.
 
-1. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-2. Copy `.env.example` to `.env` and fill in `ABOT_TOKEN`/`ABOT_USERNAME`
-   (from [@BotFather](https://t.me/BotFather)). Optionally set `ABOT_ADMIN_ID`
-   to your own numeric user id(s) to unlock `/dbdump`.
-3. Start the family's shared Postgres, from the monorepo root:
-   ```
-   docker compose up -d
-   ```
-   That is one database (`botfamily`) for all five bots, with a schema
-   each — this one uses `DB_SCHEMA=anon_bot`. No Docker? Install
-   Postgres directly and point `DATABASE_URL` at it instead.
-4. Run it:
-   ```
-   python bot.py
-   ```
+**`anon_relay` maps `(chat_id, message_id) → conversation_id`** for every
+message the bot delivers, into either chat. A reply is resolved through that
+lookup rather than through "whichever button was tapped last", so it is
+correct with several conversations interleaved and several Reply prompts
+outstanding at once. A matched row says which *conversation*; the sender's
+own account id says which *direction*.
 
-## Deploying (e.g. Railway)
+**Both sides are held to the same rule.** Either party may answer any
+conversation they are part of, for as long as its rows live — 180 days of
+silence in that conversation.
 
-The short version is below; DEPLOY.md in the family monorepo covers all five in one
-pass, which is easier than doing five of these separately.
+**One message per conversation is exempt: the one that opens it.** It has
+nothing above it to answer. The bot attaches a forced reply to the line that
+announces a new conversation, so in practice even that message arrives as a
+proper reply; the exemption is the fallback for clients that drop it, and it
+applies only while the conversation just opened is still the newest thing in
+the chat.
 
-1. Point `DATABASE_URL` at the family's Postgres, and set `DB_SCHEMA` to
-   `anon_bot`. On Railway that first one is a reference variable,
-   `${{Postgres.DATABASE_URL}}`, so several services can share one database.
-2. Set `ABOT_TOKEN`, `ABOT_USERNAME`, and the rest of `.env` as environment
-   variables on the service.
-3. Deploy — `pip install -r requirements.txt` then `python bot.py`.
+**An album is one message.** Several photos sharing a `media_group_id` are
+routed by the first of them and announced once, rather than being treated as
+three unrelated messages.
 
-### Updating a running bot
+**Nothing is delivered on a guess.** A message that names no conversation is
+held, not sent. Where exactly one destination is possible it is offered as a
+*Send it anyway* button; where more than one is, the bot says so and sends
+nothing.
 
-Pushing an update replaces the container, and the bots are set up so nobody
-notices: the new process waits on a Postgres advisory lock until the old one
-has stopped polling (no 409 Conflict, no split updates), open conversations
-and half-finished sessions are restored from the `runtime_state` table in
-this bot's own schema, and anyone whose upload was mid-flight is told to send
-it again rather than left waiting. Updates sent during the gap are held by
-Telegram and delivered on the first poll.
+**Whose words are whose.** Everything a person wrote arrives in italics;
+everything the bot says for itself stays upright. Both land in the same
+stream of bubbles, and that one difference separates them at a glance.
 
-`../UPDATES.md` has the whole picture, including what to check after a push.
-`DEPLOY_SAFETY=off` turns all of it off and restores the old behaviour.
+**No pseudonyms, no identifiers.** Threads are identified by number only.
+Nothing shown to either side is derived from the other's account — including
+the data inside buttons, which travels to the client.
 
-## Keeping a local and cloud database in sync
+### Limits
 
-If you ever run this bot from both your laptop and the cloud at different
-times, `db_merge.py` reconciles the two additively (never deletes or
-overwrites anything). It also handles the one tricky part here —
-`anon_conversations`' internal id is remapped safely across the two
-databases so `anon_follower_state`/`anon_relay` still point at the right
-place afterwards:
+An inbox link is meant to be posted publicly, so both a per-minute message
+limit and a cooldown between opening conversations apply per account, and a
+ceiling on updates per minute applies before any handler runs. All are
+configurable; see `.env.example`.
+
+---
+
+## Running it
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # fill in ABOT_TOKEN and ABOT_USERNAME
+python bot.py
 ```
-python db_merge.py --from local --into cloud --dry-run   # preview first
-python db_merge.py --from local --into cloud             # actually do it
+
+`ABOT_TOKEN` and `ABOT_USERNAME` come from
+[@BotFather](https://t.me/BotFather). `ABOT_ADMIN_ID` is optional and takes
+one or more numeric account ids.
+
+The bot needs a Postgres database. `DATABASE_URL` points at it and
+`DB_SCHEMA` (default `anon_bot`) selects the schema; the schema and its
+tables are created on first run.
+
+### Deploying
+
+Set the same values as environment variables on the host and run
+`python bot.py`. `railway.json` and `nixpacks.toml` configure a Railway
+deployment; neither is required elsewhere.
+
+A deployment replaces the running container, and the bot is built so that
+costs nothing visible. The new process waits on a Postgres advisory lock
+until the old one has stopped polling, so Telegram never sees two consumers
+of one token. Open conversations and half-written state are restored from a
+`runtime_state` table. Anyone whose message was mid-flight is told, rather
+than left waiting. Updates sent during the gap are held by Telegram and
+delivered on the first poll — nothing is lost. `DEPLOY_SAFETY=off` disables
+all of it.
+
+### Keeping two databases in sync
+
+`db_merge.py` reconciles a local database with a remote one additively —
+it never deletes or overwrites. It also remaps `anon_conversations`' internal
+ids across the two so the tables that reference them stay correct.
+
+```bash
+python db_merge.py --from local --into cloud --dry-run
+python db_merge.py --from local --into cloud
 ```
-Read the script's docstring for exactly how conflicts are handled.
 
-## Optional: cross-promoting sibling bots
-
-If you're running this alongside other bots and want each to mention the
-others in `/start`/`/help`, set `SIBLING_BOTS` in `.env` — see the comment
-in `shared_features.py`. Purely cosmetic (display text + link buttons); no
-database or file is shared.
+---
 
 ## Files
 
-- `bot.py` — handlers and the owner/follower message router
-- `anon_logic.py` — the reply-relay logic and the italic styling
-- `db.py` — this bot's own Postgres schema and queries
-- `family_link.py` — heartbeats, crash reporting, and the queue ParentBot
-  uses to run this bot's owner-only commands (identical in every bot)
-- `live_message.py` — the rule that a bot message only keeps evolving while
-  it is still the last thing in the chat (identical in every bot)
-- `lifecycle.py` — surviving a redeploy: one poller at a time, state kept in
-  Postgres, in-flight work announced (identical in every bot)
-- `shared_features.py` — `/donate` (Telegram Stars) + sibling-bot cross-promotion
-- `db_merge.py` — reconciles a laptop database with the cloud one, additively (see above)
+| file | |
+|---|---|
+| `bot.py` | Handlers, and the router that decides where a message goes |
+| `anon_logic.py` | Message relaying, text splitting, styling, flood control |
+| `db.py` | This bot's schema, queries and connection pool |
+| `i18n.py` | English, Uzbek and Russian strings |
+| `family_link.py` | Heartbeats, crash reporting, and the command queue a monitoring bot uses |
+| `lifecycle.py` | Surviving a redeploy: one poller at a time, state in Postgres |
+| `live_message.py` | When a bot message may keep evolving in place |
+| `shared_features.py` | Donations, logging, activity tracking, flood control |
+| `db_merge.py` | Reconciles two databases, additively |
+
+`family_link.py`, `lifecycle.py`, `live_message.py` and `shared_features.py`
+are shared with the sibling bots by being copied rather than imported: each
+bot is a separate deployment, so nothing crosses a repository boundary.
+
+## Requirements
+
+Python 3.11 or newer, and Postgres 16 or newer.

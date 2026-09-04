@@ -34,6 +34,7 @@ LANGUAGE_PROMPT = (
 
 STRINGS = {
     "en": {
+        "flood_wait": "You're going faster than I can keep up with -- give it about {seconds} second(s) and carry on.",
         # ---- shared keys (same name in every bot's i18n.py) ----
         "sibling_blurb": "Also part of this bot family, see below \U0001f447",
         "donation_nudge": (
@@ -151,9 +152,9 @@ STRINGS = {
         "block_button": "\U0001f6ab Block",
         "reply_prompt": "✍️ Replying in conversation #{conv_number}, to:\n{quote}",
         "reply_placeholder": "Your reply...",
+        "opening_placeholder": "Your message...",
         "not_your_conversation": "Not your conversation.",
         "blocked_answer": "Blocked.",
-        "unblock_button": "↩️ Undo",
         "unblock_button_labelled": "↩️ Unblock conversation #{conv_number}",
         "too_fast": "You're sending those faster than I can pass them on -- give it about {seconds} second(s) and try again.",
         "edit_not_relayed": (
@@ -201,6 +202,7 @@ STRINGS = {
         "unknown_command": "I don't recognize that command. Send /help to see what I can do.",
     },
     "uz": {
+        "flood_wait": "Siz men ulgurganimdan tezroq yuboryapsiz -- taxminan {seconds} soniya kutib, davom eting.",
         "sibling_blurb": "Bu bot oilasining bir qismi, pastda ko'ring \U0001f447",
         "donation_nudge": (
             "💙 Agar bu bot foydali bo'lgan bo'lsa: hosting/API xarajatlarini uni ishga "
@@ -313,9 +315,9 @@ STRINGS = {
         "block_button": "\U0001f6ab Bloklash",
         "reply_prompt": "✍️ #{conv_number}-suhbatda javob yozyapsiz. Xabar:\n{quote}",
         "reply_placeholder": "Javobingiz...",
+        "opening_placeholder": "Xabaringiz...",
         "not_your_conversation": "Bu sizning suhbatingiz emas.",
         "blocked_answer": "Bloklandi.",
-        "unblock_button": "↩️ Bekor qilish",
         "unblock_button_labelled": "↩️ #{conv_number}-suhbatni blokdan chiqarish",
         "too_fast": "Xabarlarni men yetkazishga ulgurmayotgan tezlikda yuboryapsiz — taxminan {seconds} soniyadan so'ng qayta urinib ko'ring.",
         "edit_not_relayed": (
@@ -366,6 +368,7 @@ STRINGS = {
         "unknown_command": "Bu buyruqni tanimadim. Nima qila olishimni bilish uchun /help yuboring.",
     },
     "ru": {
+        "flood_wait": "Ты отправляешь быстрее, чем я успеваю -- подожди примерно {seconds} секунд(ы) и продолжай.",
         "sibling_blurb": "Тоже часть этой семьи ботов, смотри ниже \U0001f447",
         "donation_nudge": (
             "💙 Если этот бот оказался полезным: расходы на хостинг/API покрывает тот, "
@@ -476,9 +479,9 @@ STRINGS = {
         "block_button": "\U0001f6ab Заблокировать",
         "reply_prompt": "✍️ Отвечаете в беседе #{conv_number}, на сообщение:\n{quote}",
         "reply_placeholder": "Ваш ответ...",
+        "opening_placeholder": "Ваше сообщение...",
         "not_your_conversation": "Это не ваша беседа.",
         "blocked_answer": "Заблокировано.",
-        "unblock_button": "↩️ Отменить",
         "unblock_button_labelled": "↩️ Разблокировать беседу #{conv_number}",
         "too_fast": "Вы отправляете быстрее, чем я успеваю передавать — подождите около {seconds} сек. и попробуйте снова.",
         "edit_not_relayed": (

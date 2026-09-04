@@ -301,6 +301,15 @@ def init_db(dsn: str = DATABASE_URL) -> None:
             )
             """
         )
+        # How many times this person has ever been shown the nudge. The
+        # cadence is a schedule that runs out rather than a loop (see
+        # DONATION_STEPS in shared_features.py), and this is the step counter
+        # it reads. Safe to re-run on an existing table.
+        conn.execute("ALTER TABLE donation_prompts ADD COLUMN IF NOT EXISTS times_shown INTEGER NOT NULL DEFAULT 0")
+        # Set only when DONATION_PIN is on: the message this bot pinned, so
+        # it can be unpinned again when they donate or when a newer nudge
+        # replaces it.
+        conn.execute("ALTER TABLE donation_prompts ADD COLUMN IF NOT EXISTS pinned_message_id BIGINT")
         # Nullable, no default -- NULL means "hasn't picked a language yet",
         # which is what gates the first-run picker in bot.py's /start.
         conn.execute(
@@ -436,6 +445,17 @@ def count_active_users_since(since) -> int:
         return cur.fetchone()[0]
 
 
+
+def active_user_ids_since(since) -> list[int]:
+    """Everyone with activity since `since`. Used by the family bus for an
+    aimed broadcast -- see BROADCAST_ACTIVE_DAYS in family_link.py."""
+    with pooled_read() as conn:
+        cur = conn.execute(
+            "SELECT DISTINCT user_id FROM activity_events WHERE occurred_at >= %s",
+            (since,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
 def list_all_users() -> list[int]:
     """Everyone this bot could send an unprompted message to.
 
@@ -514,38 +534,83 @@ def update_star_transaction(payload: str, status: str, charge_id: str | None = N
 
 # ---------- donation-reminder cooldown ----------
 
-def bump_donation_action(user_id: int) -> tuple[int, str | None]:
-    """Increments this user's action counter and returns (new total, when the
-    nudge was last shown). One statement, because this runs on the success
-    path of every completed action and the two halves were previously two
-    separate round trips."""
+def bump_donation_action(user_id: int) -> tuple[int, str | None, int, bool]:
+    """Increments this user's action counter and returns everything the nudge
+    decision needs: (actions since the last nudge, when it was last shown,
+    how many times it has ever been shown, has this person ever donated).
+
+    One statement. This runs on the success path of every completed action --
+    every finished pack, every conversion, every download -- so it is one of
+    the hottest writes in the family, and the database is on another
+    continent. The donation check used to be two round trips and the "have
+    they already given" question would have made it three.
+
+    `times_shown` is what turns the cadence from "every N actions forever"
+    into a schedule that runs out: see DONATION_STEPS in shared_features.py.
+    The paid check is what stops the bot thanking somebody by asking them
+    again.
+    """
     with pooled() as conn:
         cur = conn.execute(
             """
-            INSERT INTO donation_prompts (user_id, action_count, last_shown_at)
-            VALUES (%s, 1, NULL)
-            ON CONFLICT (user_id) DO UPDATE SET action_count = donation_prompts.action_count + 1
-            RETURNING action_count, last_shown_at
+            WITH bumped AS (
+                INSERT INTO donation_prompts (user_id, action_count, last_shown_at)
+                VALUES (%(uid)s, 1, NULL)
+                ON CONFLICT (user_id) DO UPDATE
+                   SET action_count = donation_prompts.action_count + 1
+                RETURNING action_count, last_shown_at, times_shown
+            )
+            SELECT b.action_count, b.last_shown_at, b.times_shown,
+                   EXISTS (SELECT 1 FROM star_transactions t
+                            WHERE t.user_id = %(uid)s AND t.status = 'paid')
+            FROM bumped b
             """,
-            (user_id,),
+            {"uid": user_id},
         )
         row = cur.fetchone()
         conn.commit()
-        return row[0], row[1]
+        return row[0], row[1], row[2] or 0, bool(row[3])
 
 
 def reset_donation_prompt(user_id: int) -> None:
-    """Zeroes the action counter and stamps 'last_shown_at' -- call right
-    after actually showing the nudge, not on every check."""
+    """Zeroes the action counter, stamps 'last_shown_at' and counts the
+    showing -- call right after actually showing the nudge, not on every
+    check."""
     now = datetime.now(timezone.utc).isoformat()
     with pooled() as conn:
         conn.execute(
             """
-            INSERT INTO donation_prompts (user_id, action_count, last_shown_at)
-            VALUES (%s, 0, %s)
-            ON CONFLICT (user_id) DO UPDATE SET action_count = 0, last_shown_at = excluded.last_shown_at
+            INSERT INTO donation_prompts (user_id, action_count, last_shown_at, times_shown)
+            VALUES (%s, 0, %s, 1)
+            ON CONFLICT (user_id) DO UPDATE SET
+                action_count = 0,
+                last_shown_at = excluded.last_shown_at,
+                times_shown = donation_prompts.times_shown + 1
             """,
             (user_id, now),
+        )
+        conn.commit()
+
+
+def get_pinned_donation_message(user_id: int) -> int | None:
+    """The id of the nudge this bot pinned in that person's chat, if any."""
+    with pooled_read() as conn:
+        cur = conn.execute(
+            "SELECT pinned_message_id FROM donation_prompts WHERE user_id = %s", (user_id,)
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def set_pinned_donation_message(user_id: int, message_id: int | None) -> None:
+    with pooled() as conn:
+        conn.execute(
+            """
+            INSERT INTO donation_prompts (user_id, action_count, pinned_message_id)
+            VALUES (%s, 0, %s)
+            ON CONFLICT (user_id) DO UPDATE SET pinned_message_id = excluded.pinned_message_id
+            """,
+            (user_id, message_id),
         )
         conn.commit()
 
@@ -797,30 +862,55 @@ def forget_anon_relay(chat_id: int, message_id: int) -> None:
 
 
 def record_relay_and_touch(
-    chat_id: int, message_ids, conversation_id: int,
+    conversation_id: int,
+    owner_chat_id: int, owner_message_ids,
+    follower_chat_id: int, follower_message_ids,
     last_owner_msg_id: int, last_follower_msg_id: int,
 ) -> None:
-    """The two writes that follow every relayed message, in one transaction.
+    """Everything one relayed message leaves behind, in one statement.
 
-    Both always happen together -- the relay rows are what let a later reply
-    find this conversation, the anchors are what make that reply quote the
-    right message -- so doing them separately meant two round trips and a
-    window where one had landed and the other had not."""
-    ids = list(message_ids)
-    now = datetime.now(timezone.utc).isoformat()
+    Both chats get rows, and they get them together. Which conversation a
+    reply belongs to is read out of anon_relay, so a message with no row is
+    a message neither side can answer -- and the anchors are what make that
+    reply quote the right bubble. A data-modifying CTE puts the insert and
+    the anchor update in a single round trip, which matters here rather than
+    generally: the database is on another continent from the container, so
+    each extra statement on the hot path of every message is a real fraction
+    of a second added to how long "Sent" takes to appear.
+
+    Either id list may be empty; the arrays simply contribute no rows.
+
+    The guest's own messages are in here too, which they were not before.
+    Without them the guest's side of the chat was only half-tracked: editing
+    something they had written got no answer at all, while the owner editing
+    a reply was told the edit had not travelled, and a guest quoting their
+    own earlier message was told it matched no conversation.
+    """
     with pooled() as conn:
-        if ids:
-            conn.execute(
-                "INSERT INTO anon_relay (chat_id, message_id, conversation_id, is_prompt) "
-                "SELECT %s, unnest(%s::bigint[]), %s, FALSE "
-                "ON CONFLICT (chat_id, message_id) DO UPDATE SET "
-                "conversation_id = excluded.conversation_id, is_prompt = FALSE",
-                (chat_id, ids, conversation_id),
-            )
         conn.execute(
-            "UPDATE anon_conversations SET last_owner_msg_id = %s, last_follower_msg_id = %s, "
-            "last_activity_at = %s WHERE id = %s",
-            (last_owner_msg_id, last_follower_msg_id, now, conversation_id),
+            """
+            WITH written AS (
+                INSERT INTO anon_relay (chat_id, message_id, conversation_id, is_prompt)
+                SELECT chat_id, message_id, %(conv)s, FALSE FROM (
+                    SELECT %(ochat)s::bigint AS chat_id, unnest(%(oids)s::bigint[]) AS message_id
+                    UNION ALL
+                    SELECT %(fchat)s::bigint, unnest(%(fids)s::bigint[])
+                ) s
+                ON CONFLICT (chat_id, message_id) DO UPDATE
+                   SET conversation_id = excluded.conversation_id, is_prompt = FALSE
+            )
+            UPDATE anon_conversations
+               SET last_owner_msg_id = %(omsg)s, last_follower_msg_id = %(fmsg)s,
+                   last_activity_at = %(now)s
+             WHERE id = %(conv)s
+            """,
+            {
+                "conv": conversation_id,
+                "ochat": owner_chat_id, "oids": list(owner_message_ids),
+                "fchat": follower_chat_id, "fids": list(follower_message_ids),
+                "omsg": last_owner_msg_id, "fmsg": last_follower_msg_id,
+                "now": datetime.now(timezone.utc).isoformat(),
+            },
         )
         conn.commit()
 
@@ -868,10 +958,20 @@ def get_routing_context(user_id: int, chat_id: int) -> dict:
     different tables and none depends on another, so one statement does.
 
     Returns:
-      active        -- the conversation an un-replied message would go to, or None
-      owned         -- how many live conversations this user owns an inbox for
-      other_threads -- whether this chat holds any conversation OTHER than
-                       `active` that a message might have been meant for
+      active           -- the conversation an un-replied message would go to, or None
+      owned            -- how many live conversations this user owns an inbox for
+      newest_is_active -- whether the last thing this bot put in this chat
+                          belongs to `active`, i.e. nothing from another
+                          thread has arrived since it was opened
+
+    `newest_is_active` used to be `other_threads` -- "does this chat hold any
+    conversation at all besides the active one" -- which is true for every
+    returning guest and so refused the opening message of every inbox after
+    their first. Relay message ids climb within a chat, so ORDER BY
+    message_id DESC LIMIT 1 is the newest bot message in it, and asking
+    whether *that* belongs to the active conversation is the same safety
+    check made against what actually happened rather than against what has
+    ever happened.
     """
     with pooled_read() as conn:
         cur = conn.execute(
@@ -886,9 +986,9 @@ def get_routing_context(user_id: int, chat_id: int) -> dict:
               (SELECT count(*) FROM anon_conversations o
                 WHERE o.owner_user_id = %(uid)s
                   AND (o.follower_first_msg_at IS NOT NULL OR o.last_owner_msg_id IS NOT NULL)),
-              EXISTS (SELECT 1 FROM anon_relay r
-                       WHERE r.chat_id = %(chat)s
-                         AND r.conversation_id IS DISTINCT FROM s.conversation_id)
+              (SELECT r.conversation_id FROM anon_relay r
+                WHERE r.chat_id = %(chat)s
+                ORDER BY r.message_id DESC LIMIT 1)
             FROM (SELECT 1) AS one
             LEFT JOIN state s ON TRUE
             LEFT JOIN anon_conversations c ON c.id = s.conversation_id
@@ -904,7 +1004,12 @@ def get_routing_context(user_id: int, chat_id: int) -> dict:
                 "conv_number": row[2], "last_owner_msg_id": row[3],
                 "last_follower_msg_id": row[4], "follower_first_msg_at": row[5],
             }
-        return {"active": active, "owned": row[6] or 0, "other_threads": bool(row[7])}
+        newest = row[7]
+        # No relay rows at all means nothing has been said in this chat, so
+        # there is nothing the message could be answering either.
+        newest_is_active = newest is None or newest == conversation_id
+        return {"active": active, "owned": row[6] or 0,
+                "newest_is_active": newest_is_active}
 
 
 def get_conversation_for_relay(chat_id: int, message_id: int) -> tuple[int | None, bool]:
